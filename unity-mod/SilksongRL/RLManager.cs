@@ -2,9 +2,6 @@ using BepInEx;
 using BepInEx.Configuration;
 using HarmonyLib;
 using UnityEngine;
-using System;
-using System.Threading.Tasks;
-using HutongGames.PlayMaker.Actions;
 using UnityEngine.SceneManagement;
 
 namespace SilksongRL
@@ -13,43 +10,29 @@ namespace SilksongRL
     public class RLManager : BaseUnityPlugin
     {
         // Config entries
-        private ConfigEntry<string> configHost;
-        private ConfigEntry<int> configPort;
         private ConfigEntry<string> configTargetBoss;
         private ConfigEntry<float> configStepInterval;
-        private ConfigEntry<bool> configEvalMode;
 
-        public static bool isAgentControlEnabled = false;
-        private bool isInEval;
+        public static bool isLoggingEnabled = false;
 
         // Hero and Boss references (tracked via Harmony patches)
         public static HeroController Hero { get; private set; }
         public static HealthManager Boss { get; private set; }
-        
+
         // Static logger reference for use in Harmony patches and other classes
         public static BepInEx.Logging.ManualLogSource StaticLogger;
 
-        private SocketClient client;
         private float stepInterval;
 
         private static IBossEncounter currentEncounter;
-        
-        public static ActionSpaceType CurrentActionSpaceType => 
-            currentEncounter?.GetActionSpaceType() ?? ActionSpaceType.Basic;
-        
+
         private TrainingEpisodeManager episodeManager;
 
-        private float[] previousObservations;
-        private Action previousAction;
-        private bool hasPreviousStep = false;
-        private bool pendingDoneTransition = false; // Set when episode ends, cleared after storing final transition
-        private int whoDied = -1; // 0: Hornet, 1: Boss (same use as above ^^^)
-
-        private bool isProcessingStep = false;
-
-        public static Action currentAction = new Action();
-
         private float lastStepTime = 0f;
+
+        private int currentEpisodeId = 0;
+        private float[] lastLoggedObs;
+        private Action lastLoggedHumanAction;
 
         private void Awake()
         {
@@ -58,33 +41,15 @@ namespace SilksongRL
 
             SceneManager.sceneLoaded += OnSceneLoaded;
 
-            configHost = Config.Bind("Connection", "Host", "localhost", 
-                "Server hostname to connect to");
-            configPort = Config.Bind("Connection", "Port", 8000, 
-                "Server port to connect to");
             configTargetBoss = Config.Bind("Training", "TargetBoss", "Lace_1",
                 "Target boss encounter (e.g., Lace_1)");
             configStepInterval = Config.Bind("Training", "StepInterval", 0.1f,
-                "Time interval between RL steps in seconds");
-            configEvalMode = Config.Bind("Training", "EvalMode", false,
-                "If true, runs in evaluation mode (no training, just inference)");
-            
+                "Time interval between logging steps in seconds");
+
             stepInterval = configStepInterval.Value;
-            isInEval = configEvalMode.Value;
-            
+
             var harmony = new Harmony("silksongrl");
             harmony.PatchAll();
-            
-            SocketConfig socketConfig = new SocketConfig
-            {
-                Host = configHost.Value,
-                Port = configPort.Value,
-                Timeout = 10f,
-                MaxReconnectAttempts = 5,
-                ReconnectDelay = 1f
-            };
-            client = new SocketClient(socketConfig);
-            StaticLogger.LogInfo($"[RL] Connecting to {configHost.Value}:{configPort.Value}");
         }
 
         private void OnSceneLoaded(Scene scene, LoadSceneMode mode)
@@ -113,17 +78,12 @@ namespace SilksongRL
                     StaticLogger.LogInfo("[RL] Screen capture updater initialized for hybrid observation");
                 }
             }
-            
+
             episodeManager = new TrainingEpisodeManager(currentEncounter);
             episodeManager.OnSimulateKeyPress = SimulateKeyPress;
-            episodeManager.OnResetComplete = ResetRL;
 
             StaticLogger.LogInfo($"[RL] Initialized with encounter: {currentEncounter.GetEncounterName()}");
             StaticLogger.LogInfo($"[RL] Observation size: {currentEncounter.GetObservationSize()}");
-            StaticLogger.LogInfo($"[RL] Action space: {CurrentActionSpaceType} ({ActionManager.GetActionSpaceShape(CurrentActionSpaceType).Length} actions)");
-            StaticLogger.LogInfo($"[RL] Mode: {(isInEval ? "Evaluation" : "Training")}");
-            
-            _ = InitializeClientAsync();
 
             SceneManager.sceneLoaded -= OnSceneLoaded;
         }
@@ -145,61 +105,21 @@ namespace SilksongRL
 
         private void OnDestroy()
         {
-            client?.Disconnect();
-            StaticLogger.LogInfo("[RL] Client disconnected");
-        }
-
-        private async Task InitializeClientAsync()
-        {
-            try
-            {
-                // Connect first (no-op for HTTP, establishes connection for sockets)
-                bool connected = await client.ConnectAsync();
-                if (!connected)
-                {
-                    StaticLogger.LogError("[RL] Failed to connect to server!");
-                    return;
-                }
-
-                string bossName = currentEncounter.GetEncounterName();
-                int obsSize = currentEncounter.GetObservationSize();
-                int[] actionSpaceShape = ActionManager.GetActionSpaceShape(CurrentActionSpaceType);
-                ObservationType obsType = currentEncounter.GetObservationType();
-                int vectorObsSize = currentEncounter.GetVectorObservationSize();
-                var (visualWidth, visualHeight) = currentEncounter.GetVisualObservationSize();
-                
-                StaticLogger.LogInfo($"[RL] Initializing client for boss: {bossName}");
-                StaticLogger.LogInfo($"[RL]   Observation size: {obsSize}, type: {obsType}, vector size: {vectorObsSize}");
-                if (obsType == ObservationType.Hybrid)
-                    StaticLogger.LogInfo($"[RL]   Visual size: {visualWidth}x{visualHeight}");
-                
-                var response = await client.InitializeAsync(bossName, obsSize, actionSpaceShape, obsType, vectorObsSize, visualWidth, visualHeight);
-                
-                if (response != null && response.initialized)
-                {
-                    StaticLogger.LogInfo($"[RL] Client initialized successfully. Checkpoint loaded: {response.checkpoint_loaded}");
-                }
-                else
-                {
-                    StaticLogger.LogError("[RL] Client initialization failed!");
-                }
-            }
-            catch (Exception e)
-            {
-                StaticLogger.LogError($"[RL] Error initializing client: {e.Message}");
-            }
+            DatasetLogger.Close();
         }
 
         private void Update()
         {
-            // Toggle control when pressing P
-            if (Input.GetKeyDown(KeyCode.P))
+            // Toggle logging (human play, dataset capture) when pressing O
+            if (Input.GetKeyDown(KeyCode.O))
             {
-                isAgentControlEnabled = !isAgentControlEnabled;
-                
-                StaticLogger.LogInfo($"[RL] Agent control {(isAgentControlEnabled ? "enabled" : "disabled")}. Hero: {(Hero != null ? "Found" : "Not found")}, Boss: {(Boss != null ? "Found" : "Not found")}");
+                isLoggingEnabled = !isLoggingEnabled;
+                if (!isLoggingEnabled)
+                    DatasetLogger.Close(); // libera el .csv (nada de lock) mientras el juego sigue corriendo
+
+                StaticLogger.LogInfo($"[RL] Logging {(isLoggingEnabled ? "enabled" : "disabled")}. Hero: {(Hero != null ? "Found" : "Not found")}, Boss: {(Boss != null ? "Found" : "Not found")}");
             }
-            
+
             // Log resolution diagnostics when pressing L
             if (Input.GetKeyDown(KeyCode.L))
             {
@@ -209,161 +129,56 @@ namespace SilksongRL
             }
         }
 
-        private GUIStyle pingStyle;
-        
-        private void OnGUI()
-        {
-            if (client == null) return;
-            
-            if (pingStyle == null)
-            {
-                pingStyle = new GUIStyle(GUI.skin.label);
-                pingStyle.normal.textColor = Color.white;
-            }
-            
-            float ping = client.lastPingMs;
-            string pingText = $"{ping:F0} ms";
-            
-            float padding = 10f;
-            float width = 40f;
-            float height = 25f;
-            Rect rect = new Rect(Screen.width - width - padding, padding, width, height);
-            
-            GUI.color = Color.black;
-            GUI.Label(new Rect(rect.x + 1, rect.y + 1, rect.width, rect.height), pingText, pingStyle);
-            
-            GUI.color = Color.white;
-            GUI.Label(rect, pingText, pingStyle);
-        }
-
         private void FixedUpdate()
         {
-
-            if (!isAgentControlEnabled)
-            {
-                currentAction = new Action();
+            if (!isLoggingEnabled)
                 return;
-            }
 
-            // Ensure currentAction is never null
-            if (currentAction == null)
-            {
-                currentAction = new Action();
-            }
-
-            // Update episode state (death detection, etc.)
-            var previousState = episodeManager.CurrentState;
+            var previousLoggingState = episodeManager.CurrentState;
             episodeManager.UpdateEpisodeState(Hero, Boss);
-            
-            // If we just transitioned to a death state, mark that we need to store a done transition
-            if (previousState == TrainingEpisodeManager.EpisodeState.Training && 
-                (episodeManager.CurrentState == TrainingEpisodeManager.EpisodeState.HeroDead || 
+
+            int outcome = -1; // -1 = en curso, 0 = murió Hornet, 1 = murió el boss
+            if (previousLoggingState == TrainingEpisodeManager.EpisodeState.Training &&
+                (episodeManager.CurrentState == TrainingEpisodeManager.EpisodeState.HeroDead ||
                  episodeManager.CurrentState == TrainingEpisodeManager.EpisodeState.BossDead ||
                  episodeManager.CurrentState == TrainingEpisodeManager.EpisodeState.HeroStuck))
             {
-                pendingDoneTransition = true;
-                // HeroDead or HeroStuck = hero died (0), BossDead = boss died (1)
-                whoDied = (episodeManager.CurrentState == TrainingEpisodeManager.EpisodeState.BossDead) ? 1 : 0;
-                StaticLogger.LogInfo($"[RL] Episode ended - will store final transition with done=true");
+                outcome = (episodeManager.CurrentState == TrainingEpisodeManager.EpisodeState.BossDead) ? 1 : 0;
+
+                // Loggear la fila terminal ACA, antes de HandleResetSequence: ese método
+                // dispara el reset (F5) en este mismo frame y devuelve true, lo que cortaría
+                // la ejecución antes de llegar al LogRow/currentEpisodeId++ de más abajo.
+                // Si murió el boss, Boss ya es null en este frame (así lo detecta
+                // TrainingEpisodeManager), así que no hay estado fresco para extraer:
+                // reusamos la última observación capturada.
+                float[] obsToLog = (Hero != null && Boss != null)
+                    ? currentEncounter.ExtractObservationArray(Hero, Boss)
+                    : lastLoggedObs;
+                Action actionToLog = (Hero != null && Boss != null)
+                    ? HumanInputReader.ReadCurrentAction()
+                    : lastLoggedHumanAction;
+
+                if (obsToLog != null && actionToLog != null)
+                    DatasetLogger.LogRow(currentEpisodeId, obsToLog, actionToLog, outcome);
+
+                currentEpisodeId++; // nuevo intento a partir de la próxima fila
             }
 
-            // Handle reset sequence if needed
             if (episodeManager.HandleResetSequence(Hero, Boss))
-            {
-                return; // Skip normal step processing during reset
-            }
+                return; // no loggear durante el reset
 
-            // Step on a **frame independent** fixed time interval 
             if (Time.fixedTime - lastStepTime >= stepInterval)
             {
                 lastStepTime = Time.fixedTime;
-                _ = StepRLAsync();
-            }
-        }
-
-        private async Task StepRLAsync()
-        {
-            if (isProcessingStep) return;
-
-            isProcessingStep = true;
-
-            try
-            {
-                if (Hero == null)
+                if (Hero != null && Boss != null)
                 {
-                    StaticLogger.LogWarning("[RL] Hero is null - waiting for hero to spawn");
-                    return;
-                }
-                if (Boss == null)
-                {
-                    StaticLogger.LogWarning("[RL] Boss is null - waiting for boss to spawn");
-                    return;
-                }
-                
-                float[] currentObservations = currentEncounter.ExtractObservationArray(Hero, Boss);
-
-                // Store transition from previous step (training mode only)
-                if (!isInEval && hasPreviousStep && previousObservations != null)
-                {
-                    float reward = currentEncounter.CalculateReward(previousObservations, currentObservations, whoDied);
-                    bool done = pendingDoneTransition;
-
-                    // Run socket call off the main thread
-                    await Task.Run(async () =>
-                    {
-                        await client.StoreTransitionAsync(previousObservations, previousAction, reward, currentObservations, done).ConfigureAwait(false);
-                    }).ConfigureAwait(false);
-                    
-                    // If this was a terminal transition, clear previous step data and don't get new action
-                    if (done)
-                    {
-                        StaticLogger.LogInfo($"[RL] Stored final transition with done=true");
-                        previousObservations = null;
-                        previousAction = null;
-                        hasPreviousStep = false;
-                        pendingDoneTransition = false;
-                        whoDied = -1;
-                        return; // Don't get new action, we're in reset
-                    }
-                }
-
-                // Get action from the RL agent
-                Action action = await Task.Run(async () =>
-                {
-                    return await client.GetActionAsync(currentObservations).ConfigureAwait(false);
-                }).ConfigureAwait(false);
-
-                if (action != null)
-                {
-                    currentAction = action;
-
-                    // Only track previous state during training (needed for storing transitions)
-                    if (!isInEval)
-                    {
-                        previousObservations = currentObservations;
-                        previousAction = action;
-                        hasPreviousStep = true;
-                    }
+                    float[] obs = currentEncounter.ExtractObservationArray(Hero, Boss);
+                    Action humanAction = HumanInputReader.ReadCurrentAction();
+                    DatasetLogger.LogRow(currentEpisodeId, obs, humanAction, -1);
+                    lastLoggedObs = obs;
+                    lastLoggedHumanAction = humanAction;
                 }
             }
-            catch (Exception e)
-            {
-                StaticLogger.LogError($"[RL] Error in StepRL: {e.Message}");
-            }
-            finally
-            {
-                isProcessingStep = false;
-            }
-        }
-
-
-        private void ResetRL()
-        {
-            // Clear current action and processing flag
-            // Note: We DON'T clear previousObservations/previousAction/hasPreviousStep here
-            // because we need to store the final transition with done=true on the first step of the new episode
-            currentAction = new Action();
-            isProcessingStep = false;
         }
 
         // Static flag for F5 simulation

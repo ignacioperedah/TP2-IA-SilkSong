@@ -5,6 +5,4 @@
 
 *.csproj.user
 
-__pycache__/
-.venv/
-models/
+python-client/

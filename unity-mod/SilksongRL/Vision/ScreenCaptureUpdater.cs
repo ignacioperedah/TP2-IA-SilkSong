@@ -5,7 +5,7 @@ namespace SilksongRL
 {
     /// <summary>
     /// MonoBehaviour that updates ScreenCapture cache at end of frame.
-    /// Only captures when agent control is enabled.
+    /// Only captures when logging is enabled.
     /// Need this because frames render in LateUpdate but our agent acts
     /// during FixedUpdate. So we cache previous frame and use that.
     /// This does introduce a one frame delay but that should be negligible.
@@ -27,7 +27,7 @@ namespace SilksongRL
             {
                 yield return new WaitForEndOfFrame();
                 
-                if (RLManager.isAgentControlEnabled && screenCapture != null)
+                if (RLManager.isLoggingEnabled && screenCapture != null)
                 {
                     screenCapture.UpdateCache();
                 }

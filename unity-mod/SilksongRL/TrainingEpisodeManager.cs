@@ -70,14 +70,23 @@ namespace SilksongRL
                     consecutiveStuckSteps = 0;
                 }
 
-                // If the boss is null, it means the boss has died
-                // This is a guarantee as with the new SaveState respawn
-                // handling the boss does not go null in between as it did before
-                if (boss == null)
+                // El reload de escena (SaveState + F5 de DebugMod) anula el boss tanto si
+                // muere el boss como si muere Hornet, así que "boss == null" por sí solo no
+                // alcanza para saber quién murió. La señal confiable es la vida de Hornet en
+                // este mismo instante: si sigue viva, murió el boss (el remate es una
+                // animación scripteada, el hp del boss no siempre llega exactamente a 0).
+                // Si está en 0, murió Hornet.
+                if (boss == null && currentHeroHealth > 0)
                 {
                     CurrentState = EpisodeState.BossDead;
-                    RLManager.StaticLogger?.LogInfo($"[TrainingEpisodeManager] Boss died detected - boss is null");
+                    RLManager.StaticLogger?.LogInfo($"[TrainingEpisodeManager] Boss died detected - boss is null, hero health = {currentHeroHealth}");
                     consecutiveStuckSteps = 0; // Reset stuck counter on death
+                }
+                else if (boss == null && currentHeroHealth <= 0)
+                {
+                    CurrentState = EpisodeState.HeroDead;
+                    RLManager.StaticLogger?.LogInfo($"[TrainingEpisodeManager] Hero died detected - boss is null, hero health = {currentHeroHealth}");
+                    consecutiveStuckSteps = 0;
                 }
                 // If the hero's health has increased AND the boss is at max HP, 
                 // it means the hero has died. 
@@ -105,8 +114,12 @@ namespace SilksongRL
             switch (CurrentState)
             {
                 case EpisodeState.HeroDead:
-                    ResetEpisode();
-                    return true;
+                    // Igual que BossDead: en este setup (SaveState + F5 de DebugMod) morir
+                    // Hornet también deja Boss en null, así que hace falta el mismo ciclo de
+                    // espera + F5 + esperar a que reaparezca el boss. Resetear de una sin F5
+                    // dejaba boss==null para siempre y esto se detectaba como Hero died en cada
+                    // tick siguiente (loop infinito de log).
+                    return HandleDeathReset(hero, boss, "Hero died");
 
                 case EpisodeState.BossDead:
                     return HandleDeathReset(hero, boss, "Boss defeated");

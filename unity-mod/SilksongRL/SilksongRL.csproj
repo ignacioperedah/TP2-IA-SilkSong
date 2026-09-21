@@ -118,15 +118,23 @@
     <Compile Include="Encounters\LaceEncounter.cs" />
     <Compile Include="Encounters\LaceSecondEncounter.cs" />
     <Compile Include="Encounters\SavageBeastflyEncounter.cs" />
+    <Compile Include="Logging\DatasetLogger.cs" />
+    <Compile Include="Logging\HumanInputReader.cs" />
     <Compile Include="Vision\ResolutionDiagnostics.cs" />
     <Compile Include="RLManager.cs" />
     <Compile Include="Vision\ScreenCapture.cs" />
     <Compile Include="Vision\ScreenCaptureOld.cs" />
     <Compile Include="Vision\ScreenCaptureTest.cs" />
     <Compile Include="Vision\ScreenCaptureUpdater.cs" />
-    <Compile Include="SocketClient.cs" />
     <Compile Include="TrainingEpisodeManager.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
+  <PropertyGroup>
+    <!-- Copia el .dll compilado a BepInEx/plugins del juego en cada build.
+         Debe ir después del Import de arriba: ahí es donde $(TargetPath) y el
+         $(GameDir) de SilksongRL.csproj.user quedan resueltos a su valor final. -->
+    <PostBuildEvent>if not exist "$(GameDir)\BepInEx\plugins\" mkdir "$(GameDir)\BepInEx\plugins\"
+copy /Y "$(TargetPath)" "$(GameDir)\BepInEx\plugins\$(TargetFileName)"</PostBuildEvent>
+  </PropertyGroup>
 </Project>
